@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Office Viewer · Paseo</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="项目文件">
+      <header class="brand"><span class="brand-mark" aria-hidden="true">▤</span><div><h1>Office Viewer</h1><p>Paseo · 本地预览</p></div><span class="version">1.0</span></header>
+      <div class="workspace-heading"><span id="workspace-name">项目文件</span><button id="refresh-files" class="icon-button" title="刷新文件列表" aria-label="刷新文件列表">↻</button></div>
+      <nav id="breadcrumbs" class="breadcrumbs" aria-label="文件路径"></nav>
+      <div class="file-search"><input id="file-filter" type="search" aria-label="筛选当前文件夹" placeholder="筛选当前文件夹…" autocomplete="off"></div>
+      <div id="file-list" class="file-list" aria-label="文件列表"></div>
+      <p id="list-status" class="list-status" role="status"></p>
+      <footer class="sidebar-footer"><span class="local-dot"></span>本地处理 · 只读<span>PDF / DOCX / XLSX / PPTX</span><a href="/third-party-licenses.txt" target="_blank" rel="noopener">第三方许可</a></footer>
+    </aside>
+    <main class="main">
+      <header class="document-header"><div class="document-heading"><span id="file-kind" class="kind-badge" hidden></span><div><h2 id="file-name">文档预览</h2><p id="file-meta">选择左侧文件开始预览</p></div></div><button id="reload-file" disabled title="重新读取文件">↻ 重新读取</button></header>
+      <div id="toolbar" class="toolbar" hidden>
+        <div id="page-controls" class="control-group" hidden><button id="previous-page" aria-label="上一页">←</button><label for="page-number">第</label><input id="page-number" type="number" min="1" value="1" aria-label="页码"><span id="page-count">/ 1 页</span><button id="next-page" aria-label="下一页">→</button></div>
+        <div class="control-group zoom-controls"><button id="zoom-out" aria-label="缩小">−</button><output id="zoom-value">100%</output><button id="zoom-in" aria-label="放大">＋</button><button id="zoom-reset" title="恢复默认缩放">重置</button></div>
+      </div>
+      <div id="preview-status" class="preview-status" role="status" aria-live="polite"></div>
+      <div id="preview-error" class="preview-error" role="alert" hidden></div>
+      <div id="format-note" class="format-note" hidden></div>
+      <div id="sheet-tabs" class="sheet-tabs" role="tablist" aria-label="工作表" hidden></div>
+      <div id="sheet-controls" class="sheet-controls" hidden><div class="control-group"><button id="previous-rows" aria-label="上一组行">↑</button><span id="row-range"></span><button id="next-rows" aria-label="下一组行">↓</button></div><div class="control-group"><button id="previous-columns" aria-label="上一组列">←</button><span id="column-range"></span><button id="next-columns" aria-label="下一组列">→</button></div><label class="cell-jump">定位单元格 <input id="cell-address" placeholder="A1" aria-label="定位单元格"><button id="go-to-cell">前往</button></label></div>
+      <div id="cell-inspector" class="cell-inspector" hidden><strong id="selected-cell">单元格</strong><span id="cell-value">点击单元格查看完整内容及公式。</span></div>
+      <section id="preview" class="preview" aria-label="文档内容"><div class="empty-state"><div class="empty-symbol" aria-hidden="true">▤</div><h2>在这里查看工作结果</h2><p>从左侧选择 PDF、Word、Excel 或 PowerPoint 文件。</p><div class="format-chips"><span>PDF</span><span>DOCX</span><span>XLSX</span><span>PPTX</span></div><p class="empty-footnote">文件在本机读取和显示，预览不会修改原文件。</p></div></section>
+    </main>
+  </div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

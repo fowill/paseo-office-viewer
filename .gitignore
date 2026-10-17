@@ -1,0 +1,12 @@
+node_modules/
+.cache/
+.tools/
+dist/
+server/assets.generated.ts
+test-results/
+playwright-report/
+tests/fixtures/
+audit/
+*.log
+.env
+.env.*
