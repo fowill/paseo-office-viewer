@@ -11,16 +11,23 @@ window.FileReader = NativeFileReader;
 GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
 
 const $ = (id) => document.getElementById(id);
-const tokenFromUrl = new URLSearchParams(location.hash.slice(1)).get("token");
+const hash = new URLSearchParams(location.hash.slice(1));
+const tokenFromUrl = hash.get("token");
 if (tokenFromUrl) {
   sessionStorage.setItem("paseo-office-token", tokenFromUrl);
+  sessionStorage.setItem("paseo-office-embed", hash.get("embed") === "1" ? "1" : "0");
   history.replaceState(null, "", location.pathname + location.search);
 }
 const token = tokenFromUrl || sessionStorage.getItem("paseo-office-token");
-const state = { directory: "", entries: [], path: "", document: null, generation: 0, listGeneration: 0, controller: null, zoom: 1, page: 1, pages: 1, sheet: 0, row: 0, column: 0, busy: false };
+const embedded = sessionStorage.getItem("paseo-office-embed") === "1";
+document.body.classList.toggle("embed", embedded);
+if (embedded) $("empty-prompt").textContent = "在右侧 Office Viewer 面板中点击文件开始预览";
+const state = { directory: "", entries: [], path: "", document: null, generation: 0, listGeneration: 0, controller: null, zoom: 1, fit: true, page: 1, pages: 1, sheet: 0, row: 0, column: 0, busy: false };
 const rowsPerPage = 100;
 const columnsPerPage = 30;
 let pptQueue = Promise.resolve();
+let events;
+let selectedSequence = -1;
 
 // The PPT renderer has shared chart state. Keep its operations in order.
 function runPpt(operation) {
@@ -55,7 +62,49 @@ async function api(route, path, signal) {
 function showError(error) {
   $("preview-status").textContent = "";
   $("preview-error").textContent = `无法预览：${error.message || error}`;
+  $("preview-error").title = $("preview-error").textContent;
   $("preview-error").hidden = false;
+  $("loading-progress").hidden = true;
+}
+
+function applyTheme(theme) {
+  if (!theme) return;
+  const variables = { surface0: "bg", surface1: "panel", surface2: "control", border: "line", foreground: "fg", foregroundMuted: "muted", accent: "accent", statusDanger: "danger" };
+  for (const [color, variable] of Object.entries(variables)) document.documentElement.style.setProperty(`--${variable}`, theme[color]);
+  // Resolve both hexadecimal and rgb() host colors through the browser.
+  const probe = element("span");
+  probe.style.color = theme.surface0;
+  document.body.append(probe);
+  const rgb = getComputedStyle(probe).color.match(/[\d.]+/g).map(Number);
+  probe.remove();
+  const dark = .2126 * rgb[0] + .7152 * rgb[1] + .0722 * rgb[2] < 128;
+  document.documentElement.style.colorScheme = dark ? "dark" : "light";
+  document.documentElement.style.setProperty("--page-shadow", `0 1px 3px rgba(0,0,0,${dark ? ".4" : ".12"})`);
+}
+
+function selectFromSession(selected) {
+  if (!selected || selected.seq < selectedSequence) return;
+  selectedSequence = selected.seq;
+  void openFile(selected.path);
+}
+
+async function readSession() {
+  const session = await (await api("/api/session", "")).json();
+  applyTheme(session.theme);
+  selectFromSession(session.selected);
+}
+
+function connectSession() {
+  // EventSource cannot set Authorization. Only this endpoint accepts a query token.
+  events = new EventSource(`/api/events?token=${encodeURIComponent(token)}`);
+  events.addEventListener("select", event => selectFromSession(JSON.parse(event.data)));
+  events.addEventListener("theme", event => applyTheme(JSON.parse(event.data)));
+  // Reading after connection also recovers changes missed during a reconnect.
+  events.addEventListener("open", () => void readSession().catch(showError));
+  events.addEventListener("error", () => {
+    $("preview-status").textContent = "预览连接中断，正在重连…";
+  });
+  void readSession().catch(showError);
 }
 
 function renderFileList() {
@@ -67,7 +116,7 @@ function renderFileList() {
     button.dataset.path = entry.path;
     button.title = entry.name;
     button.setAttribute("aria-label", `${entry.directory ? "打开文件夹" : "预览"} ${entry.name}`);
-    const kind = entry.directory ? "▱" : entry.name.split(".").pop().toUpperCase();
+    const kind = entry.directory ? "▸" : entry.name.split(".").pop().toUpperCase();
     button.append(element("span", `file-symbol${entry.directory ? " folder" : ""}`, kind));
     const details = element("span", "file-details");
     details.append(element("strong", "", entry.name), element("small", "", entry.directory ? "文件夹" : formatSize(entry.size)));
@@ -134,11 +183,16 @@ function updateControls() {
   $("next-page").disabled = state.busy || state.page >= state.pages;
   $("zoom-value").textContent = `${Math.round(state.zoom * 100)}%`;
   $("zoom-out").disabled = state.busy || state.zoom <= 0.5;
-  $("zoom-in").disabled = state.busy || state.zoom >= 2;
+  $("zoom-in").disabled = state.busy || state.zoom >= 3;
   $("zoom-reset").disabled = state.busy;
+  $("zoom-reset").textContent = doc?.kind === "xlsx" ? "100%" : "适应";
+  $("zoom-reset").title = doc?.kind === "xlsx" ? "恢复默认缩放" : "适应宽度";
+  $("zoom-reset").setAttribute("aria-pressed", String(state.fit && doc?.kind !== "xlsx"));
+  $("loading-progress").hidden = !state.busy;
 }
 
-async function openFile(path) {
+async function openFile(path, force = false) {
+  if (!force && path === state.path && (state.busy || state.document)) return;
   const generation = ++state.generation;
   state.controller?.abort();
   state.controller = new AbortController();
@@ -146,6 +200,7 @@ async function openFile(path) {
   state.document = null;
   state.path = path;
   state.zoom = 1;
+  state.fit = true;
   state.page = 1;
   state.busy = true;
   const name = path.split("/").pop();
@@ -154,11 +209,14 @@ async function openFile(path) {
   $("file-kind").textContent = kind.toUpperCase();
   $("file-kind").hidden = false;
   $("file-meta").textContent = path;
+  $("file-meta").title = path;
+  $("file-name").title = path;
   $("preview").className = "preview";
   $("preview").replaceChildren();
   $("preview").scrollTop = 0;
   $("preview-error").hidden = true;
   $("preview-status").textContent = "正在读取文件…";
+  $("loading-progress").hidden = false;
   $("reload-file").disabled = false;
   for (const id of ["toolbar", "sheet-tabs", "sheet-controls", "cell-inspector", "format-note"]) $(id).hidden = true;
   renderFileList();
@@ -192,6 +250,7 @@ async function openFile(path) {
       // Hyperlinks remain readable; document content cannot navigate this viewer.
       doc.host.querySelectorAll("a").forEach((link) => link.removeAttribute("href"));
       $("preview").replaceChildren(doc.host);
+      applyDocumentZoom();
       $("format-note").textContent = "Word 网页预览。复杂分页、浮动对象和公式的显示可能与 Word 不同。";
       $("format-note").hidden = false;
     } else if (kind === "xlsx") {
@@ -221,6 +280,7 @@ async function openFile(path) {
     }
     if (generation !== state.generation) return;
     $("toolbar").hidden = false;
+    $("format-note").title = $("format-note").textContent;
     $("preview-status").textContent = kind === "pdf" || kind === "pptx" ? `已加载 · 第 ${state.page} / ${state.pages} 页 · 只读预览` : "已加载 · 只读预览";
     state.busy = false;
     updateControls();
@@ -251,7 +311,11 @@ async function renderPage() {
     if (doc.kind === "pdf") {
       const page = await doc.pdf.getPage(state.page);
       if (doc.disposed) return;
-      const viewport = page.getViewport({ scale: 1.25 * state.zoom });
+      if (state.fit) {
+        lastWidth = availableWidth();
+        state.zoom = Math.max(.5, Math.min(3, lastWidth / page.getViewport({ scale: 1 }).width));
+      }
+      const viewport = page.getViewport({ scale: state.zoom });
       stage.style.width = `${viewport.width}px`;
       stage.style.height = `${viewport.height}px`;
       stage.style.setProperty("--total-scale-factor", viewport.scale);
@@ -268,6 +332,10 @@ async function renderPage() {
       await doc.textLayer.render();
     } else {
       const dimensions = doc.ppt.processor.getSlideDimensions();
+      if (state.fit) {
+        lastWidth = availableWidth();
+        state.zoom = Math.max(480, Math.min(1920, lastWidth)) / 960;
+      }
       const width = Math.round(960 * state.zoom);
       const height = Math.round(width * dimensions.cy / dimensions.cx);
       canvas.width = Math.round(width * dpr);
@@ -317,7 +385,8 @@ function inspectCell(address, cell, td) {
   td.classList.add("selected");
   $("selected-cell").textContent = address;
   const value = cell ? (cell.w ?? XLSX.utils.format_cell(cell)) : "";
-  $("cell-value").textContent = cell?.f ? `公式：=${cell.f}\n已保存的值：${cell.v === undefined ? "无缓存结果，无法计算" : value}` : value || "（空白）";
+  $("cell-value").textContent = cell?.f ? `公式：=${cell.f} · 已保存的值：${cell.v === undefined ? "无缓存结果，无法计算" : value}` : value || "（空白）";
+  $("cell-value").title = $("cell-value").textContent;
   $("cell-address").value = address;
 }
 
@@ -354,14 +423,14 @@ function renderSheet() {
   table.style.zoom = state.zoom;
   const colgroup = element("colgroup");
   const rowNumbers = element("col");
-  rowNumbers.style.width = "52px";
+  rowNumbers.style.width = "44px";
   colgroup.append(rowNumbers);
   const header = element("tr");
   header.append(element("th", "", ""));
   for (let column = state.column; column <= endColumn; column++) {
     const col = element("col");
     const storedWidth = sheet["!cols"]?.[column];
-    col.style.width = `${Math.min(720, Math.max(90, storedWidth?.wpx || (storedWidth?.wch || 13) * 7 + 14))}px`;
+    col.style.width = `${Math.min(720, Math.max(72, storedWidth?.wpx || (storedWidth?.wch || 13) * 7 + 12))}px`;
     colgroup.append(col);
     const th = element("th", "", XLSX.utils.encode_col(column));
     th.scope = "col";
@@ -428,24 +497,51 @@ async function changePage(page) {
   await renderPage();
 }
 
-function changeZoom(zoom) {
+function availableWidth() {
+  const style = getComputedStyle($("preview"));
+  return $("preview").clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+}
+
+function applyDocumentZoom() {
+  const doc = state.document;
+  if (doc?.kind === "docx") {
+    const page = doc.host.querySelector("section.docx");
+    if (state.fit && page) {
+      lastWidth = availableWidth();
+      state.zoom = Math.min(1, lastWidth / page.offsetWidth);
+    }
+    doc.host.style.zoom = state.zoom;
+  } else if (doc?.kind === "xlsx") {
+    const table = $("preview").querySelector(".sheet-grid");
+    if (table) {
+      const oldZoom = Number(table.style.zoom) || 1;
+      const top = $("preview").scrollTop / oldZoom;
+      const left = $("preview").scrollLeft / oldZoom;
+      table.style.zoom = state.zoom;
+      $("preview").scrollTop = top * state.zoom;
+      $("preview").scrollLeft = left * state.zoom;
+    }
+  }
+}
+
+function changeZoom(zoom, fit = false) {
   if (state.busy || !state.document) return;
-  state.zoom = Math.max(.5, Math.min(2, Math.round(zoom * 10) / 10));
+  state.fit = fit;
+  state.zoom = Math.max(.5, Math.min(3, zoom));
+  if (["docx", "xlsx"].includes(state.document.kind)) applyDocumentZoom();
+  else void renderPage();
   updateControls();
-  if (state.document.kind === "docx") state.document.host.style.zoom = state.zoom;
-  else if (state.document.kind === "xlsx") renderSheet();
-  else renderPage();
 }
 
 $("refresh-files").addEventListener("click", () => loadDirectory(state.directory));
 $("file-filter").addEventListener("input", renderFileList);
-$("reload-file").addEventListener("click", () => openFile(state.path));
+$("reload-file").addEventListener("click", () => openFile(state.path, true));
 $("previous-page").addEventListener("click", () => changePage(state.page - 1));
 $("next-page").addEventListener("click", () => changePage(state.page + 1));
 $("page-number").addEventListener("change", () => changePage(Math.trunc(Number($("page-number").value))));
-$("zoom-in").addEventListener("click", () => changeZoom(state.zoom + .1));
-$("zoom-out").addEventListener("click", () => changeZoom(state.zoom - .1));
-$("zoom-reset").addEventListener("click", () => changeZoom(1));
+$("zoom-in").addEventListener("click", () => changeZoom(state.zoom * 1.1));
+$("zoom-out").addEventListener("click", () => changeZoom(state.zoom / 1.1));
+$("zoom-reset").addEventListener("click", () => changeZoom(1, true));
 $("previous-rows").addEventListener("click", () => moveSheet(-rowsPerPage, 0));
 $("next-rows").addEventListener("click", () => moveSheet(rowsPerPage, 0));
 $("previous-columns").addEventListener("click", () => moveSheet(0, -columnsPerPage));
@@ -465,7 +561,34 @@ $("go-to-cell").addEventListener("click", () => {
   if (td) { inspectCell(address, sheet[address], td); td.scrollIntoView({ block: "nearest", inline: "nearest" }); }
 });
 $("cell-address").addEventListener("keydown", (event) => { if (event.key === "Enter") $("go-to-cell").click(); });
-window.addEventListener("beforeunload", () => releaseDocument(state.document));
+let resizeTimer;
+let lastWidth = 0;
+new ResizeObserver(() => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(function fitAfterResize() {
+    if (!state.fit || !state.document) return;
+    if (state.busy) { resizeTimer = setTimeout(fitAfterResize, 200); return; }
+    const width = availableWidth();
+    if (Math.abs(width - lastWidth) <= 2) return;
+    lastWidth = width;
+    changeZoom(state.zoom, true);
+  }, 200);
+}).observe($("preview"));
+window.addEventListener("pagehide", () => { events?.close(); releaseDocument(state.document); });
+window.addEventListener("hashchange", () => {
+  const next = new URLSearchParams(location.hash.slice(1));
+  const nextToken = next.get("token");
+  if (!nextToken) return;
+  // A host may navigate its existing browser to the same URL with a new fragment.
+  // Reload after saving the fragment so initialization also switches embed mode.
+  sessionStorage.setItem("paseo-office-token", nextToken);
+  sessionStorage.setItem("paseo-office-embed", next.get("embed") === "1" ? "1" : "0");
+  history.replaceState(null, "", location.pathname + location.search);
+  location.reload();
+});
 
-if (token) loadDirectory("");
+if (token) {
+  if (embedded) connectSession();
+  else loadDirectory("");
+}
 else { $("list-status").textContent = "请从 Paseo 插件打开此页面。"; showError(new Error("缺少本地预览会话。请从 Paseo 插件或启动命令提供的完整链接打开。")); }

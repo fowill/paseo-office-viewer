@@ -70,6 +70,20 @@ test('API requires a valid session token', async () => {
   assert.equal((await api('files')).status, 200);
 });
 
+test('session and event APIs keep authentication, origin, and GET-only checks', async () => {
+  for (const endpoint of ['session', 'events']) {
+    assert.equal((await fetch(`${origin}/api/${endpoint}`)).status, 401);
+    assert.equal((await api(endpoint, '', { headers: { Authorization: 'Bearer invalid' } })).status, 401);
+    assert.equal((await api(endpoint, '', { headers: { Origin: 'https://example.invalid' } })).status, 403);
+    assert.equal((await api(endpoint, '', { method: 'POST' })).status, 405);
+  }
+  for (const endpoint of ['session', 'files', 'file', 'stat']) {
+    assert.equal((await fetch(`${origin}/api/${endpoint}?token=${token}`)).status, 401);
+  }
+  assert.equal((await fetch(`${origin}/api/events?token=invalid`)).status, 401);
+  assert.equal((await fetch(`${origin}/api/events?token=${token}`, { headers: { Origin: 'https://example.invalid' } })).status, 403);
+});
+
 test('foreign Origin and Host headers are rejected', async () => {
   assert.equal((await api('files', '', { headers: { Origin: 'https://example.invalid' } })).status, 403);
   assert.equal((await api('files', '', { headers: { Origin: origin } })).status, 200);
@@ -102,6 +116,7 @@ test('listing contains supported formats and directories, preserves Unicode path
   const nested = await (await api('files', '子目录')).json();
   assert.equal(nested.entries[0].path, '子目录/中文 文件.pdf');
   assert.equal(nested.path, '子目录');
+  assert.deepEqual(await preview.list(workspace, '子目录'), { entries: nested.entries });
 });
 
 test('every format returns the complete original bytes and expected MIME type', async () => {
@@ -148,6 +163,7 @@ test('parent traversal, absolute paths, and junction escapes cannot read outside
   assert.equal((await api('file', 'external/outside.pdf')).status, 403);
   const listing = await (await api('files')).json();
   assert.ok(!listing.entries.some((entry: { name: string }) => entry.name === 'external'));
+  assert.ok(!(await preview.list(workspace, '')).entries.some(entry => entry.name === 'external'));
 });
 
 test('missing files, unsupported formats, directories, and unknown routes return clear errors', async () => {
@@ -164,6 +180,74 @@ test('files larger than 100 MiB are rejected without reading them into memory', 
   try { await oversized.truncate(MAX_FILE_BYTES + 1); } finally { await oversized.close(); }
   assert.equal((await api('file', 'oversized.pdf')).status, 413);
   assert.equal((await api('stat', 'oversized.pdf')).status, 413);
+});
+
+test('select validates containment, file type, and size before changing session selection', async () => {
+  const selected = await preview.select(workspace, '子目录/中文 文件.pdf');
+  assert.equal(selected.viewerConnected, false);
+  assert.equal(new URLSearchParams(new URL(selected.url).hash.slice(1)).get('embed'), '1');
+  const before = await (await api('session')).json();
+  assert.equal(before.workspaceName, 'workspace');
+  assert.equal(before.selected.path, '子目录/中文 文件.pdf');
+  assert.equal(before.selected.seq, 1);
+  await assert.rejects(preview.select(workspace, '../outside/outside.pdf'), { status: 403 });
+  await assert.rejects(preview.select(workspace, '子目录'), { status: 415 });
+  await assert.rejects(preview.select(workspace, 'unsupported.txt'), { status: 415 });
+  await assert.rejects(preview.select(workspace, 'oversized.pdf'), { status: 413 });
+  await assert.rejects(preview.list(workspace, '../outside'), { status: 403 });
+  assert.deepEqual((await (await api('session')).json()).selected, before.selected);
+});
+
+test('SSE reports live viewers and pushes file selections and theme changes', { timeout: 10_000 }, async () => {
+  const controller = new AbortController();
+  const response = await fetch(`${origin}/api/events?token=${token}`, { signal: controller.signal });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-type')!, /text\/event-stream/);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  async function nextEvent(name: string) {
+    while (true) {
+      const separator = buffer.indexOf('\n\n');
+      if (separator >= 0) {
+        const message = buffer.slice(0, separator);
+        buffer = buffer.slice(separator + 2);
+        if (message.startsWith(`event: ${name}\n`)) return JSON.parse(message.split('\ndata: ')[1]);
+      } else {
+        const chunk = await reader.read();
+        assert.equal(chunk.done, false, 'SSE closed before sending the event');
+        buffer += decoder.decode(chunk.value, { stream: true });
+      }
+    }
+  }
+  try {
+    const selected = await preview.select(workspace, fixtureNames[0]);
+    assert.equal(selected.viewerConnected, true);
+    const first = await nextEvent('select');
+    assert.equal(first.path, fixtureNames[0]);
+    const repeated = await preview.select(workspace, fixtureNames[0]);
+    assert.equal(repeated.viewerConnected, true);
+    const second = await nextEvent('select');
+    assert.deepEqual(second, { path: first.path, seq: first.seq + 1 });
+
+    const theme = { surface0: '#1b1d21', surface1: '#202327', surface2: '#2a2e34', border: '#30353c', foreground: '#e6e8eb', foregroundMuted: '#9aa3ad', accent: '#7fb3a4', accentForeground: '#1b1d21', statusSuccess: '#70b480', statusWarning: '#e5b567', statusDanger: '#e57878' };
+    const themed = new URL(await preview.openWorkspace(workspace, { embed: true, theme }));
+    assert.equal(new URLSearchParams(themed.hash.slice(1)).get('token'), token);
+    assert.deepEqual(await nextEvent('theme'), theme);
+    const session = await (await api('session')).json();
+    assert.deepEqual(session.theme, theme);
+    assert.deepEqual(session.selected, second);
+  } finally {
+    await reader.cancel();
+    controller.abort();
+  }
+  let connected = true;
+  for (let attempt = 0; attempt < 50 && connected; attempt++) {
+    connected = (await preview.select(workspace, fixtureNames[0])).viewerConnected;
+    if (connected) await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(connected, false, 'Closing the SSE connection must allow the next click to reopen a viewer');
 });
 
 test('workspace sessions are isolated and the same root reuses its session', async () => {

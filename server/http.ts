@@ -1,9 +1,10 @@
-import { createServer } from 'node:http';
+import { createServer, type ServerResponse } from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { realpath, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { assets } from './assets.generated';
+import type { PreviewTheme } from '../shared/preview';
 
 const formats: Record<string, string> = {
   '.pdf': 'application/pdf',
@@ -12,6 +13,13 @@ const formats: Record<string, string> = {
   '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 };
 export const MAX_FILE_BYTES = 100 * 1024 * 1024;
+
+interface PreviewSession {
+  root: string;
+  theme?: PreviewTheme;
+  selected?: { path: string; seq: number };
+  viewers: Set<ServerResponse>;
+}
 
 // Resolve both paths before checking containment, including Windows junctions.
 async function workspacePath(root: string, relative: string) {
@@ -23,9 +31,64 @@ async function workspacePath(root: string, relative: string) {
   return filename;
 }
 
+async function listEntries(root: string, relative: string) {
+  const filename = await workspacePath(root, relative);
+  if (!(await stat(filename)).isDirectory()) {
+    throw Object.assign(new Error('请选择文件夹。'), { status: 400 });
+  }
+  const directoryEntries = await readdir(filename, { withFileTypes: true });
+  const visibleEntries = directoryEntries.filter(entry =>
+    !entry.name.startsWith('.') && !['node_modules', '$RECYCLE.BIN', 'System Volume Information'].includes(entry.name) &&
+    (entry.isDirectory() || Boolean(formats[path.extname(entry.name).toLowerCase()])));
+  const entries = [];
+  for (const entry of visibleEntries) {
+    try {
+      const entryPath = path.relative(root, path.join(filename, entry.name));
+      const resolved = await workspacePath(root, entryPath);
+      const item = await stat(resolved);
+      entries.push({ name: entry.name, path: entryPath.split(path.sep).join('/'), directory: item.isDirectory(), size: item.size, modified: item.mtimeMs });
+    } catch { /* A removed file or an external junction is not a selectable document. */ }
+  }
+  entries.sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name, 'zh-CN', { numeric: true }));
+  return { path: path.relative(root, filename).split(path.sep).join('/'), workspaceName: path.basename(root), entries };
+}
+
+async function previewFile(root: string, relative: string) {
+  const filename = await workspacePath(root, relative);
+  const info = await stat(filename);
+  const mime = formats[path.extname(filename).toLowerCase()];
+  if (!info.isFile() || !mime) {
+    throw Object.assign(new Error('支持 PDF、DOCX、XLSX 和 PPTX。'), { status: 415 });
+  }
+  if (info.size > MAX_FILE_BYTES) {
+    throw Object.assign(new Error('文件超过 100 MiB 限制。'), { status: 413 });
+  }
+  return { filename, info, mime };
+}
+
+function broadcast(session: PreviewSession, event: string, data: unknown) {
+  const message = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const viewer of session.viewers) {
+    if (viewer.destroyed || viewer.writableEnded) session.viewers.delete(viewer);
+    else viewer.write(message);
+  }
+}
+
 export async function createPreviewServer() {
-  const sessions = new Map<string, string>();
+  const sessions = new Map<string, PreviewSession>();
   let origin = '';
+
+  async function sessionFor(directory: string) {
+    const root = await realpath(directory);
+    if (!(await stat(root)).isDirectory()) throw new Error('工作区目录不存在。');
+    const existing = [...sessions].find(([, value]) => value.root === root);
+    if (existing) return { token: existing[0], session: existing[1] };
+    const token = randomBytes(32).toString('base64url');
+    const session: PreviewSession = { root, viewers: new Set() };
+    sessions.set(token, session);
+    return { token, session };
+  }
+
   const server = createServer(async (request, response) => {
     response.setHeader('X-Content-Type-Options', 'nosniff');
     response.setHeader('Referrer-Policy', 'no-referrer');
@@ -54,37 +117,36 @@ export async function createPreviewServer() {
         response.end(Buffer.from(asset.base64, 'base64'));
         return;
       }
-      const token = request.headers.authorization?.replace(/^Bearer /, '');
-      const root = token ? sessions.get(token) : undefined;
-      if (!root) { json(401, { error: '预览连接已失效。请从 Paseo 重新打开。' }); return; }
+      // EventSource cannot attach an Authorization header. Only this route accepts a query token.
+      const token = request.headers.authorization?.replace(/^Bearer /, '') ??
+        (url.pathname === '/api/events' ? url.searchParams.get('token') : undefined);
+      const session = token ? sessions.get(token) : undefined;
+      if (!session) { json(401, { error: '预览连接已失效。请从 Paseo 重新打开。' }); return; }
+      if (url.pathname === '/api/session') {
+        json(200, { workspaceName: path.basename(session.root), selected: session.selected, theme: session.theme });
+        return;
+      }
+      if (url.pathname === '/api/events') {
+        response.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', Connection: 'keep-alive' });
+        session.viewers.add(response);
+        response.write(': connected\n\n');
+        const heartbeat = setInterval(() => response.write(': heartbeat\n\n'), 25_000);
+        heartbeat.unref();
+        response.on('close', () => {
+          clearInterval(heartbeat);
+          session.viewers.delete(response);
+        });
+        return;
+      }
       if (!['/api/files', '/api/file', '/api/stat'].includes(url.pathname)) {
         json(404, { error: '接口不存在。' }); return;
       }
       const relative = url.searchParams.get('path') ?? '';
-      const filename = await workspacePath(root, relative);
-      const info = await stat(filename);
       if (url.pathname === '/api/files') {
-        if (!info.isDirectory()) { json(400, { error: '请选择文件夹。' }); return; }
-        const directoryEntries = await readdir(filename, { withFileTypes: true });
-        const visibleEntries = directoryEntries.filter(entry =>
-          !entry.name.startsWith('.') && !['node_modules', '$RECYCLE.BIN', 'System Volume Information'].includes(entry.name) &&
-          (entry.isDirectory() || Boolean(formats[path.extname(entry.name).toLowerCase()])));
-        const entries = [];
-        for (const entry of visibleEntries) {
-          try {
-            const entryPath = path.relative(root, path.join(filename, entry.name));
-            const resolved = await workspacePath(root, entryPath);
-            const item = await stat(resolved);
-            entries.push({ name: entry.name, path: entryPath.split(path.sep).join('/'), directory: item.isDirectory(), size: item.size, modified: item.mtimeMs });
-          } catch { /* A removed file or an external junction is not a selectable document. */ }
-        }
-        entries.sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name, 'zh-CN', { numeric: true }));
-        json(200, { path: path.relative(root, filename).split(path.sep).join('/'), workspaceName: path.basename(root), entries });
+        json(200, await listEntries(session.root, relative));
         return;
       }
-      const mime = formats[path.extname(filename).toLowerCase()];
-      if (!info.isFile() || !mime) { json(415, { error: 'V1.0 支持 PDF、DOCX、XLSX 和 PPTX。' }); return; }
-      if (info.size > MAX_FILE_BYTES) { json(413, { error: '文件超过 V1.0 的 100 MiB 限制。' }); return; }
+      const { filename, info, mime } = await previewFile(session.root, relative);
       if (url.pathname === '/api/stat') {
         json(200, { size: info.size, modified: info.mtimeMs });
         return;
@@ -108,14 +170,30 @@ export async function createPreviewServer() {
   if (!address || typeof address === 'string') throw new Error('无法启动本机预览服务。');
   origin = `http://127.0.0.1:${address.port}`;
   return {
-    async openWorkspace(directory: string) {
-      const root = await realpath(directory);
-      if (!(await stat(root)).isDirectory()) throw new Error('工作区目录不存在。');
-      let token = [...sessions].find(([, value]) => value === root)?.[0];
-      if (!token) { token = randomBytes(32).toString('base64url'); sessions.set(token, root); }
-      return `${origin}/#token=${token}`;
+    async openWorkspace(directory: string, options: { embed?: boolean; theme?: PreviewTheme } = {}) {
+      const { token, session } = await sessionFor(directory);
+      if (options.theme) {
+        session.theme = options.theme;
+        broadcast(session, 'theme', options.theme);
+      }
+      return `${origin}/#token=${token}${options.embed ? '&embed=1' : ''}`;
+    },
+    async list(directory: string, relative: string) {
+      const { session } = await sessionFor(directory);
+      const { entries } = await listEntries(session.root, relative);
+      return { entries };
+    },
+    async select(directory: string, relative: string) {
+      const { token, session } = await sessionFor(directory);
+      const { filename } = await previewFile(session.root, relative);
+      session.selected = { path: path.relative(session.root, filename).split(path.sep).join('/'), seq: (session.selected?.seq ?? 0) + 1 };
+      broadcast(session, 'select', session.selected);
+      return { url: `${origin}/#token=${token}&embed=1`, viewerConnected: session.viewers.size > 0 };
     },
     async close() {
+      for (const session of sessions.values()) {
+        for (const viewer of session.viewers) viewer.end();
+      }
       sessions.clear();
       server.closeAllConnections();
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));

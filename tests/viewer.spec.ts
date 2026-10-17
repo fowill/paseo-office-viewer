@@ -15,6 +15,7 @@ let url: string;
 let server: Awaited<ReturnType<typeof createPreviewServer>>;
 let pageErrors: string[];
 let externalRequests: string[];
+const darkTheme = { surface0: '#181b20', surface1: '#20242a', surface2: '#303640', border: '#424953', foreground: '#edf1f5', foregroundMuted: '#a4adb8', accent: '#8db9e8', accentForeground: '#111820', statusSuccess: '#82bd94', statusWarning: '#d6b877', statusDanger: '#ef9393' };
 
 async function openFile(page: Page, name: string) {
   await page.getByRole('button', { name: `预览 ${name}`, exact: true }).click();
@@ -33,8 +34,8 @@ async function expectPopulatedCanvas(page: Page) {
     }
     return { width: node.width, height: node.height, dark };
   });
-  expect(pixels.width).toBeGreaterThan(500);
-  expect(pixels.height).toBeGreaterThan(300);
+  expect(pixels.width).toBeGreaterThanOrEqual(480);
+  expect(pixels.height).toBeGreaterThanOrEqual(270);
   expect(pixels.dark).toBeGreaterThan(500);
 }
 
@@ -102,9 +103,10 @@ test('PDF renders Chinese, selectable text, image, page controls, and zoom', asy
   await expect(page.locator('#preview-status')).toContainText('第 2 / 2 页');
   await expect(page.locator('.textLayer')).toContainText('第二页中文内容');
   await expect(page.locator('#next-page')).toBeDisabled();
+  const zoom = Number((await page.locator('#zoom-value').innerText()).replace('%', ''));
   await page.locator('#zoom-in').click();
-  await expect(page.locator('#zoom-value')).toHaveText('110%');
   await expect(page.locator('#zoom-in')).toBeEnabled();
+  expect(Number((await page.locator('#zoom-value').innerText()).replace('%', ''))).toBeGreaterThan(zoom);
   await page.locator('#page-number').fill('1');
   await page.locator('#page-number').press('Enter');
   await expect(page.locator('#preview-status')).toContainText('第 1 / 2 页');
@@ -120,8 +122,8 @@ test('Word renders both pages, table, image, and inline formatting', async ({ pa
   await expect.poll(() => page.locator('#preview img').evaluate((image: HTMLImageElement) => image.complete && image.naturalWidth > 0)).toBe(true);
   await expect(page.getByText('粗体', { exact: true })).toHaveCSS('font-weight', '700');
   await page.locator('#zoom-out').click();
-  await expect(page.locator('#zoom-value')).toHaveText('90%');
-  await expect(page.locator('.docx-host')).toHaveCSS('zoom', '0.9');
+  await expect(page.locator('#zoom-value')).toHaveText('91%');
+  expect(await page.locator('.docx-host').evaluate(node => Number(getComputedStyle(node).zoom))).toBeCloseTo(1 / 1.1, 3);
 });
 
 test('Excel retains displayed values, dates, merges, cached formulas, and sheet switching', async ({ page }) => {
@@ -173,12 +175,13 @@ test('PowerPoint renders nonblank slides, navigation, zoom, and reload', async (
   await expectPopulatedCanvas(page);
   const secondPixels = await page.locator('#preview canvas').evaluate((canvas: HTMLCanvasElement) => canvas.toDataURL());
   expect(secondPixels).not.toBe(firstPixels);
+  const fitWidth = Number(await page.locator('#preview canvas').getAttribute('width'));
   await page.locator('#zoom-in').click();
   await expect(page.locator('#zoom-in')).toBeEnabled();
-  await expect(page.locator('#preview canvas')).toHaveAttribute('width', '1056');
+  expect(Number(await page.locator('#preview canvas').getAttribute('width'))).toBeCloseTo(fitWidth * 1.1, -1);
   await page.locator('#reload-file').click();
   await expect(page.locator('#preview-status')).toContainText('第 1 / 2 页');
-  await expect(page.locator('#zoom-value')).toHaveText('100%');
+  await expect(page.locator('#preview canvas')).toHaveAttribute('width', String(fitWidth));
   await expectPopulatedCanvas(page);
 });
 
@@ -248,4 +251,64 @@ test('missing authentication gives an actionable message', async ({ page }) => {
   await page.goto(new URL(url).origin);
   await expect(page.locator('#preview-error')).toContainText('缺少本地预览会话');
   await expect(page.locator('#list-status')).toContainText('请从 Paseo 插件打开此页面');
+});
+
+test('embedded preview switches files through one live session and skips repeated selection', async ({ page }) => {
+  const selected = await server.select(workspace, '示例文档.pdf');
+  expect(selected.viewerConnected).toBe(false);
+  let downloads = 0;
+  page.on('request', request => { if (new URL(request.url()).pathname === '/api/file') downloads++; });
+  await page.goto(selected.url);
+  await expect(page.locator('.sidebar')).toBeHidden();
+  await expect(page.locator('.textLayer')).toContainText('本地文档预览测试');
+  await expect(page.locator('#loading-progress')).toBeHidden();
+  expect(downloads).toBe(1);
+  expect((await server.select(workspace, '示例文档.pdf')).viewerConnected).toBe(true);
+  // A different file immediately after the duplicate ensures both events were processed.
+  await server.select(workspace, '示例演示.pptx');
+  await expect(page.locator('#file-name')).toHaveText('示例演示.pptx');
+  await expect(page.locator('#preview-status')).toContainText('已加载');
+  expect(downloads).toBe(2);
+  await server.select(workspace, '示例报告.docx');
+  await expect(page.locator('section.docx')).toHaveCount(2);
+  await expect.poll(() => page.locator('#preview img').evaluate((img: HTMLImageElement) => img.naturalWidth)).toBeGreaterThan(0);
+  await page.reload();
+  await expect(page.locator('.sidebar')).toBeHidden();
+  await expect(page.locator('section.docx')).toHaveCount(2);
+  await page.goto('about:blank');
+  await expect.poll(async () => (await server.select(workspace, '示例数据.xlsx')).viewerConnected).toBe(false);
+});
+
+test('embedded theme updates live, keeps document paper white, and fits resized PDF', async ({ page }) => {
+  const embeddedUrl = await server.openWorkspace(workspace, { embed: true, theme: darkTheme });
+  await server.select(workspace, '示例文档.pdf');
+  await page.goto(embeddedUrl);
+  await expect(page.locator('.textLayer')).toContainText('本地文档预览测试');
+  await expect(page.locator('body')).toHaveCSS('color', 'rgb(237, 241, 245)');
+  await expect(page.locator('.page-stage')).toHaveCSS('background-color', 'rgb(255, 255, 255)');
+  const wide = await page.locator('#preview canvas').evaluate(canvas => canvas.getBoundingClientRect().width);
+  await page.setViewportSize({ width: 900, height: 1000 });
+  await expect.poll(() => page.locator('#preview canvas').evaluate(canvas => canvas.getBoundingClientRect().width)).toBeLessThan(wide - 200);
+  await server.openWorkspace(workspace, { theme: { ...darkTheme, surface0: '#eeeeee', foreground: '#222222' } });
+  await expect(page.locator('html')).toHaveCSS('background-color', 'rgb(238, 238, 238)');
+  await expect(page.locator('html')).toHaveCSS('color-scheme', 'light');
+  await expect(page.locator('.page-stage')).toHaveCSS('background-color', 'rgb(255, 255, 255)');
+  await server.openWorkspace(workspace, { theme: darkTheme });
+  await server.select(workspace, '示例数据.xlsx');
+  await expect(page.locator('td[data-address="B4"]')).toHaveText('-34.75');
+  await expect(page.locator('.preview.spreadsheet')).toHaveCSS('background-color', 'rgb(24, 27, 32)');
+  await expect(page.locator('.sheet-grid')).toHaveCSS('background-color', 'rgb(255, 255, 255)');
+  await expect(page.locator('td[data-address="B4"]')).toHaveCSS('background-color', 'rgb(255, 255, 255)');
+});
+
+test('Excel zoom preserves the table, selected cell, and scroll position', async ({ page }) => {
+  await openFile(page, '大表与空表.xlsx');
+  await page.locator('td[data-address="A2"]').click();
+  const table = await page.locator('.sheet-grid').elementHandle();
+  await page.locator('#preview').evaluate(node => { node.scrollTop = 400; node.scrollLeft = 100; });
+  await page.locator('#zoom-in').click();
+  expect(await table!.evaluate(node => node === document.querySelector('.sheet-grid'))).toBe(true);
+  await expect(page.locator('td[data-address="A2"]')).toHaveClass('selected');
+  expect(await page.locator('#preview').evaluate(node => node.scrollTop)).toBeGreaterThanOrEqual(400);
+  expect(await page.locator('#preview').evaluate(node => node.scrollLeft)).toBeGreaterThanOrEqual(100);
 });

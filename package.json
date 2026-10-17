@@ -1,6 +1,6 @@
 {
   "name": "paseo-office-viewer",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "repository": { "type": "git", "url": "https://github.com/fowill/paseo-office-viewer.git" },
   "description": "Local, read-only Office and PDF previews for Paseo Desktop",
