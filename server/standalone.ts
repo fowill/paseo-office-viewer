@@ -9,7 +9,7 @@ if (values.help) {
   const preview = await createPreviewServer();
   try {
     const url = await preview.openWorkspace(path.resolve(values.root!));
-    console.log(`Paseo Office Viewer 1.1.0\nWorkspace: ${path.resolve(values.root!)}\nOpen: ${url}\nStop: Ctrl+C`);
+    console.log(`Paseo Office Viewer 1.1.1\nWorkspace: ${path.resolve(values.root!)}\nOpen: ${url}\nStop: Ctrl+C`);
     for (const signal of ['SIGINT', 'SIGTERM'] as const) {
       process.once(signal, async () => { await preview.close(); process.exit(0); });
     }

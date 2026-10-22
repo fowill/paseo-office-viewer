@@ -2,6 +2,6 @@
   "id": "office-viewer",
   "name": "Office Viewer",
   "description": "Read-only local previews for PDF, Word, Excel, and PowerPoint files.",
-  "requirements": { "paseo": ">=0.11.4 <0.13.0" },
+  "requirements": { "paseo": ">=0.11.4 <0.14.0" },
   "build": [["node", "scripts/prepare.mjs"]]
 }
